@@ -1,111 +1,164 @@
-const express = require("express");
+const Fastify = require("fastify");
 const axios = require("axios");
+const cors = require("@fastify/cors");
 
-const app = express();
+const app = Fastify({ logger: false });
+
+// ⚠️ Render dùng PORT này
 const PORT = process.env.PORT || 3000;
 
-const API_URL = "http://160.250.247.143:9000/api";
+// API gốc
+const API_URL = "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=ee2d066f9a42e456cbd7f1ca034b88ea";
 
-// ====== CONFIG ======
-const ADMIN = "@vanminh2603";
-let history = []; // lưu 50 phiên
+// cache
+let cacheData = null;
+let lastFetch = 0;
+const CACHE_TIME = 5000; // 5s
 
-// ====== PHÂN TÍCH CẦU ======
-function analyzePattern(data) {
-    if (data.length < 5) return "random";
+/* ================= AI ================= */
 
-    const last = data.slice(-5).map(x => x.result);
+function getStreak(data) {
+    let streak = 1;
+    for (let i = 1; i < data.length; i++) {
+        if (data[i].resultTruyenThong === data[0].resultTruyenThong) {
+            streak++;
+        } else break;
+    }
+    return streak;
+}
 
-    // cầu bệt
-    if (last.every(x => x === "chan")) return "bet_chan";
-    if (last.every(x => x === "le")) return "bet_le";
+function detectPattern(data) {
+    let results = data.slice(0, 6).map(i => i.resultTruyenThong);
 
-    // cầu 1-1
     let zigzag = true;
-    for (let i = 1; i < last.length; i++) {
-        if (last[i] === last[i - 1]) zigzag = false;
+    for (let i = 1; i < results.length; i++) {
+        if (results[i] === results[i - 1]) {
+            zigzag = false;
+            break;
+        }
     }
 
-    if (zigzag) {
-        return last[last.length - 1] === "chan" ? "bet_le" : "bet_chan";
+    if (zigzag) return "Cầu 1-1 (ZigZag)";
+    if (results.every(r => r === "TAI")) return "Bệt TÀI";
+    if (results.every(r => r === "XIU")) return "Bệt XỈU";
+
+    return "Ngẫu nhiên";
+}
+
+function predict(data) {
+    let streak = getStreak(data);
+    let last = data[0].resultTruyenThong;
+
+    let prediction = "TAI";
+    let confidence = 50;
+    let reason = "";
+
+    if (streak >= 3) {
+        prediction = last === "TAI" ? "XIU" : "TAI";
+        confidence = 70;
+        reason = "Đảo cầu sau bệt";
+    } else {
+        prediction = last === "TAI" ? "XIU" : "TAI";
+        confidence = 60;
+        reason = "Cầu đổi cơ bản";
     }
 
-    return "random";
+    let pattern = detectPattern(data);
+
+    if (pattern.includes("ZigZag")) {
+        prediction = last === "TAI" ? "XIU" : "TAI";
+        confidence = 75;
+        reason = "Cầu 1-1";
+    }
+
+    return {
+        duDoan: prediction,
+        doTinCay: confidence,
+        lyDo: reason,
+        cau: pattern,
+        streak
+    };
 }
 
-// ====== AI DỰ ĐOÁN ======
-function predict(history) {
-    const pattern = analyzePattern(history);
+/* ================= ROUTES ================= */
 
-    if (pattern === "bet_chan") return "chan";
-    if (pattern === "bet_le") return "le";
+// check server sống
+app.get("/", async (req, reply) => {
+    return {
+        status: "OK",
+        message: "API Tài Xỉu MD5 đang chạy 🚀"
+    };
+});
 
-    // fallback random nhẹ
-    return Math.random() > 0.5 ? "chan" : "le";
-}
-
-// ====== CALL API ======
-async function getData() {
+// API chính
+app.get("/taixiumd5", async (req, reply) => {
     try {
-        const res = await axios.get(API_URL, { timeout: 10000 });
-        return res.data;
-    } catch {
-        return null;
+        const now = Date.now();
+
+        // dùng cache nếu chưa hết hạn
+        if (cacheData && now - lastFetch < CACHE_TIME) {
+            return cacheData;
+        }
+
+        const res = await axios.get(API_URL, { timeout: 5000 });
+        const data = res.data;
+
+        let list = data.list || [];
+
+        if (!list.length) {
+            throw new Error("Không có dữ liệu");
+        }
+
+        let ai = predict(list);
+
+        const result = {
+            status: true,
+            phienGanNhat: list[0]?.id,
+            ketQuaGanNhat: list[0]?.resultTruyenThong,
+            xucXac: list[0]?.dices,
+            tong: list[0]?.point,
+
+            // AI
+            duDoan: ai.duDoan,
+            doTinCay: ai.doTinCay + "%",
+            lyDo: ai.lyDo,
+            cau: ai.cau,
+            chuoi: ai.streak,
+
+            // thống kê
+            thongKe: data.typeStat,
+
+            // lịch sử
+            lichSu: list.slice(0, 20),
+
+            // dòng thêm
+            doanhtung: "API Tài Xỉu MD5 VIP - By Văn Minh"
+        };
+
+        // lưu cache
+        cacheData = result;
+        lastFetch = now;
+
+        return result;
+
+    } catch (err) {
+        return {
+            status: false,
+            message: "Lỗi lấy dữ liệu API",
+            error: err.message
+        };
     }
-}
+});
 
-// ====== API CHÍNH ======
-app.get("/api", async (req, res) => {
-    const data = await getData();
+/* ================= START ================= */
 
-    let phien = Date.now();
-    let result = Math.random() > 0.5 ? "chan" : "le";
+app.register(cors, { origin: true });
 
-    if (data) {
-        phien = data.phien || data.round || phien;
-        result = data.ket_qua || result;
-    }
-
-    // lưu lịch sử
-    history.push({ phien, result });
-    if (history.length > 50) history.shift();
-
-    const duDoan = predict(history);
-
-    // fake xúc xắc
-    const xucXac = [
-        Math.random() > 0.5 ? "do" : "trang",
-        Math.random() > 0.5 ? "do" : "trang",
-        Math.random() > 0.5 ? "do" : "trang"
-    ];
-
-    const soDo = xucXac.filter(x => x === "do").length;
-    const soTrang = 3 - soDo;
-
-    res.json({
-        success: true,
-        admin: ADMIN,
-        phien_hien_tai: phien,
-        du_doan: duDoan,
-        lich_su: history,
-        pattern: analyzePattern(history),
-        du_doan_xuc_xac: xucXac,
-        cua_dat:
-            soDo === 3 ? "3_do" :
-            soTrang === 3 ? "3_trang" :
-            soDo === 2 ? "2_do_1_trang" :
-            "1_do_2_trang",
-        so_do: soDo,
-        so_trang: soTrang
+app.listen({ port: PORT, host: "0.0.0.0" })
+    .then(() => {
+        console.log("🚀 Server chạy tại port " + PORT);
+    })
+    .catch(err => {
+        console.error(err);
+        process.exit(1);
     });
-});
-
-// ====== ROUTE CHECK ======
-app.get("/", (req, res) => {
-    res.send("🚀 API SOI CẦU VIP RUNNING - ADM " + ADMIN);
-});
-
-// ====== START ======
-app.listen(PORT, () => {
-    console.log("🔥 Server chạy tại port " + PORT);
-});
